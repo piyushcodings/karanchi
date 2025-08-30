@@ -1,1 +1,1 @@
-web: python crunchy.py
+web: gunicorn crunchy:app
