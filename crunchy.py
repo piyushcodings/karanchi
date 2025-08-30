@@ -94,7 +94,7 @@ def check():
     if raw:
         return res_text, 200, {"Content-Type": "application/json"}
 
-    if "account_id" not in json_res or "account_id" not in res_text:
+    if "account_id" not in res_text:
         return jsonify({
             "account": f"{email}:{password}",
             "status": "Invalid Credentials",
