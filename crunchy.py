@@ -86,7 +86,7 @@ def fetch_web_account_details(session, token, email, password, proxies=None, ua=
         )
         if me_res.status_code != 200 or me_res.status_code != 201:
             
-            return "Failed to fetch account ID.", None,me_res.text
+            return "Failed to fetch account ID.",me_res.text
         me_json = me_res.json()
         account_id = me_json.get("account_id")
         if not account_id:
