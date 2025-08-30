@@ -140,12 +140,20 @@ def check():
     if raw:
         return subs_res, 200, {"Content-Type": "application/json"}
 
-    # --- Final Response ---
-    subscription = (subs_json.get("subscriptions") or [{}])[0]
-    plan_text = subscription.get("plan", {}).get("tier", {}).get("text", "Free")
-    status_text = subscription.get("status", "Unknown")
-    trial = subscription.get("activeFreeTrial", False)
-    renewal = subscription.get("nextRenewalDate", "N/A")
+    # --- Detect Active Subscription Properly ---
+    subscriptions = subs_json.get("subscriptions", [])
+    active_sub = None
+    for sub in subscriptions:
+        if sub.get("status") == "active":
+            active_sub = sub
+            break
+    if not active_sub and subscriptions:
+        active_sub = subscriptions[0]  # fallback
+
+    plan_text = active_sub.get("plan", {}).get("tier", {}).get("text", "Free") if active_sub else "Free"
+    status_text = active_sub.get("status", "Unknown") if active_sub else "Unknown"
+    trial = active_sub.get("activeFreeTrial", False) if active_sub else False
+    renewal = active_sub.get("nextRenewalDate", "N/A") if active_sub else "N/A"
 
     return jsonify({
         "account": f"{email}:{password}",
